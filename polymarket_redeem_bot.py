@@ -5,7 +5,7 @@ from web3 import Web3
 from eth_account import Account
 from dotenv import load_dotenv
 import os
-import signal
+import multiprocessing as mp
 
 
 load_dotenv("../.env")
@@ -24,6 +24,9 @@ RPC_URL = "https://polygon-rpc.com"
 
 # 检查间隔（秒）(15 分钟 = 900 秒)
 CHECK_INTERVAL = 5 * 60
+
+# 单次执行的最大允许运行时长（秒）；用于 cron 防卡死
+RUN_TIMEOUT_SECONDS = int(os.getenv("RUN_TIMEOUT_SECONDS", "180"))
 
 # ================= 常量与 ABI =================
 
@@ -103,6 +106,22 @@ def get_redeemable_markets(proxy_address: str):
     except Exception as e:
         log(f"⚠️ Polymarket API 报错（稍后再试即可）：{e}")
         return []
+
+def rpc_healthcheck(rpc_url: str, timeout_s: int = 10) -> bool:
+    """
+    用最简单的 JSON-RPC 调用检查 RPC 是否可用。
+    这样我们可以强制 requests 的超时，避免 Web3 内部调用在某些网络环境里卡死。
+    """
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []}
+    try:
+        r = requests.post(rpc_url, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        # Polygon 主网 chainId = 137 (0x89)
+        return "result" in data
+    except Exception as e:
+        log(f"⚠️ RPC 健康检查失败：{e}")
+        return False
 
 
 def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
@@ -189,27 +208,12 @@ def run_cycle() -> None:
         log("⚠️ 未配置环境变量 PM_ADDRESS（Proxy/Safe 地址），本轮跳过。")
         return
 
-    # 给 RPC 请求加超时，避免网络问题导致脚本卡死
-    w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 10}))
-    try:
-        # 用 alarm 做“总超时”，避免底层网络调用卡死（Linux 可用）
-        def _alarm_handler(_signum, _frame):
-            raise TimeoutError("RPC connectivity check timed out")
-
-        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(10)
-        try:
-            connected = w3.is_connected()
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-
-        if not connected:
-            log("⚠️ 无法连接 RPC，本轮跳过。")
-            return
-    except Exception as e:
-        log(f"⚠️ RPC 连接检测失败，本轮跳过：{e}")
+    if not rpc_healthcheck(RPC_URL, timeout_s=10):
+        log("⚠️ RPC 不可用，本轮跳过。")
         return
+
+    # 给 Web3 的 HTTPProvider 配置超时（用于后续所有链上调用）
+    w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 10}))
 
     try:
         account = Account.from_key(PRIVATE_KEY)
@@ -229,18 +233,26 @@ def run_cycle() -> None:
 
 
 def main() -> None:
-    log("🤖 Bot 启动。")
-    log(f"🕒 检查间隔: {int(CHECK_INTERVAL / 60)} 分钟")
+    """
+    单次执行入口：跑完一轮检查/领取就退出。
+    适合配合 cron/计划任务，由外部调度决定频率。
+    """
+    log("🤖 单次执行开始。")
     log(f"👤 Proxy Address: {PROXY_ADDRESS}")
-
-    while True:
+    # 进程级 watchdog：防止 DNS/RPC/网络卡死导致 cron 堆积
+    def _worker():
         try:
             run_cycle()
         except Exception as e:
-            log(f"💥 本轮出现未捕获异常: {e}")
+            log(f"💥 单次执行出现未捕获异常: {e}")
 
-        log(f"💤 睡眠 {int(CHECK_INTERVAL / 60)} 分钟...")
-        time.sleep(CHECK_INTERVAL)
+    p = mp.Process(target=_worker, daemon=True)
+    p.start()
+    p.join(timeout=RUN_TIMEOUT_SECONDS)
+    if p.is_alive():
+        log(f"⏱️ 单次执行超时（>{RUN_TIMEOUT_SECONDS}s），已强制结束。")
+        p.terminate()
+        p.join(timeout=5)
 
 
 if __name__ == "__main__":
