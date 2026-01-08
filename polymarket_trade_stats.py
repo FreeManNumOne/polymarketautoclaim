@@ -32,6 +32,67 @@ def log(msg: str) -> None:
     print(f"[{_now_iso()}] {msg}")
 
 
+def _format_ts(ts: Optional[int]) -> str:
+    if ts is None:
+        return "-"
+    try:
+        return dt.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def _parse_time_arg(s: str) -> int:
+    """
+    支持：
+    - epoch 秒（纯数字）
+    - ISO 日期/时间：YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DDTHH:MM:SS
+      （不带时区时按“本机本地时间”解释）
+    """
+    raw = (s or "").strip()
+    if not raw:
+        raise ValueError("空时间参数")
+    if raw.isdigit():
+        return int(raw)
+    raw = raw.replace("T", " ")
+    # 允许只给日期
+    if len(raw) == 10:
+        raw = raw + " 00:00:00"
+    try:
+        d = dt.datetime.fromisoformat(raw)
+    except Exception as e:
+        raise ValueError(f"无法解析时间：{s}") from e
+    return int(d.timestamp())
+
+
+def filter_trades_by_time(
+    trades: List[Dict[str, Any]],
+    *,
+    start_ts: Optional[int],
+    end_ts: Optional[int],
+) -> List[Dict[str, Any]]:
+    """
+    过滤规则：
+    - start_ts：包含 >= start_ts
+    - end_ts：包含 <= end_ts
+    """
+    if start_ts is None and end_ts is None:
+        return trades
+    out: List[Dict[str, Any]] = []
+    for t in trades:
+        ts = t.get("timestamp")
+        try:
+            ts_i = int(ts)
+        except Exception:
+            # 没 timestamp 的记录直接跳过
+            continue
+        if start_ts is not None and ts_i < start_ts:
+            continue
+        if end_ts is not None and ts_i > end_ts:
+            continue
+        out.append(t)
+    return out
+
+
 def fetch_all_trades(
     user: str,
     *,
@@ -284,12 +345,18 @@ def summarize(
 
     settled_markets = wins + losses + no_position
 
+    winrate = None
+    denom = wins + losses
+    if denom > 0:
+        winrate = wins / denom
+
     return {
         "total_trades": total_trades,
         "markets_traded": markets_traded,
         "settled_markets": settled_markets,
         "wins": wins,
         "losses": losses,
+        "winrate": winrate,
         "no_position": no_position,
         "unsettled_or_unknown": unsettled_or_unknown,
         "win_mode": win_mode,
@@ -312,6 +379,9 @@ def main() -> None:
     parser.add_argument("--user", default=os.getenv("PM_ADDRESS"), help="钱包地址（默认读取环境变量 PM_ADDRESS）")
     parser.add_argument("--limit", type=int, default=200, help="每页拉取 trades 的条数（默认 200）")
     parser.add_argument("--max-trades", type=int, default=None, help="最多拉取多少条 trades（用于快速试跑）")
+    parser.add_argument("--start", default=None, help="统计起始时间（epoch 秒或 YYYY-MM-DD[ HH:MM:SS]）")
+    parser.add_argument("--end", default=None, help="统计结束时间（epoch 秒或 YYYY-MM-DD[ HH:MM:SS]）")
+    parser.add_argument("--since-days", type=float, default=None, help="统计最近 N 天（会覆盖 --start/--end）")
     parser.add_argument(
         "--win-mode",
         choices=["net_position", "ever_bought"],
@@ -338,8 +408,20 @@ def main() -> None:
     trades = fetch_all_trades(user, limit=args.limit, max_trades=args.max_trades)
     log(f"已拉取 trades 条数: {len(trades)}")
 
+    start_ts = _parse_time_arg(args.start) if args.start else None
+    end_ts = _parse_time_arg(args.end) if args.end else None
+    if args.since_days is not None:
+        now_ts = int(dt.datetime.now().timestamp())
+        start_ts = int(now_ts - float(args.since_days) * 86400.0)
+        end_ts = now_ts
+
+    trades_filtered = filter_trades_by_time(trades, start_ts=start_ts, end_ts=end_ts)
+    if start_ts is not None or end_ts is not None:
+        log(f"时间范围过滤: start={_format_ts(start_ts)} end={_format_ts(end_ts)}")
+        log(f"过滤后 trades 条数: {len(trades_filtered)}")
+
     stats = summarize(
-        trades,
+        trades_filtered,
         win_mode=args.win_mode,
         progress_every=args.progress_every,
         include_unsettled_mtm=bool(args.include_unsettled_mtm),
@@ -352,6 +434,8 @@ def main() -> None:
     print(f"已结算市场数（可判定胜负）: {stats['settled_markets']}")
     print(f"胜场数: {stats['wins']}")
     print(f"负场数: {stats['losses']}")
+    if stats.get("winrate") is not None:
+        print(f"胜率（wins/(wins+losses)）: {float(stats['winrate'])*100:.2f}%")
     print(f"无法判定（已结算但你无净持仓/或无数据）: {stats['no_position']}")
     print(f"未结算或无法获取（gamma 无法确认）: {stats['unsettled_or_unknown']}")
     print(f"胜负口径（win_mode）: {stats['win_mode']}")

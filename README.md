@@ -39,6 +39,16 @@ python3 polymarket_trade_stats.py --win-mode ever_bought
 python3 polymarket_trade_stats.py --include-unsettled-mtm
 ```
 
+可选：只统计一段时间（按成交时间 `timestamp` 过滤）：
+
+```bash
+# 最近 7 天
+python3 polymarket_trade_stats.py --since-days 7
+
+# 指定起止时间（也可传 epoch 秒）
+python3 polymarket_trade_stats.py --start "2026-01-01" --end "2026-01-31 23:59:59"
+```
+
 可选：输出 JSON：
 
 ```bash
