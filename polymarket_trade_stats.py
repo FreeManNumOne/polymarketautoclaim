@@ -279,6 +279,10 @@ def summarize(
     settled_pnl_total = 0.0
     unsettled_mtm_value_total = 0.0
 
+    # 风险回报分析（仅对“已结算且可判定胜负”的市场）
+    total_profit_from_wins = 0.0
+    total_loss_from_losses = 0.0
+
     market_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     resolved_cache: Dict[str, Tuple[bool, Optional[str]]] = {}
 
@@ -299,6 +303,8 @@ def summarize(
         outcomes, prices = _extract_outcomes_and_prices(market)
 
         cashflow = float(rec["sell_proceeds"]) - float(rec["buy_cost"])
+        # 净成本：买入-卖出（>=0 表示投入，<0 表示净回收现金）
+        net_cost = float(rec["buy_cost"]) - float(rec["sell_proceeds"])
 
         if not resolved or not winning_outcome:
             if include_unsettled_mtm and outcomes and prices:
@@ -317,6 +323,32 @@ def summarize(
         pnl = cashflow + settled_value
         settled_value_total += settled_value
         settled_pnl_total += pnl
+
+        # 是否“胜场/负场”的判定：沿用胜率统计的口径
+        is_win = False
+        is_loss = False
+        if win_mode == "ever_bought":
+            is_win = winning_outcome in rec["ever_bought"]
+            is_loss = not is_win
+        else:
+            if net_map:
+                best_outcome, best_shares = max(net_map.items(), key=lambda kv: kv[1])
+                if best_shares > 0:
+                    is_win = best_outcome == winning_outcome
+                    is_loss = not is_win
+
+        # 你要求的口径：
+        # - total_profit_from_wins：所有胜场的 (结算价值 - 成本) 之和
+        #   这里用 (settled_value - net_cost)；并且只累计正数部分，避免出现“胜场但交易导致为负”拉低 profit factor
+        # - total_loss_from_losses：所有负场的 成本 之和（取绝对值）
+        #   这里用 max(net_cost, 0)，避免出现净成本<=0 时把 loss 记成负数
+        if is_win:
+            profit = settled_value - net_cost
+            if profit > 0:
+                total_profit_from_wins += profit
+        elif is_loss:
+            loss_cost = net_cost if net_cost > 0 else 0.0
+            total_loss_from_losses += abs(loss_cost)
 
         if win_mode == "ever_bought":
             if winning_outcome in rec["ever_bought"]:
@@ -350,6 +382,22 @@ def summarize(
     if denom > 0:
         winrate = wins / denom
 
+    profit_factor = None
+    if total_loss_from_losses > 0:
+        profit_factor = total_profit_from_wins / total_loss_from_losses
+
+    avg_win = None
+    if wins > 0:
+        avg_win = total_profit_from_wins / wins
+
+    avg_loss = None
+    if losses > 0:
+        avg_loss = total_loss_from_losses / losses
+
+    win_loss_ratio = None
+    if avg_win is not None and avg_loss is not None and avg_loss > 0:
+        win_loss_ratio = avg_win / avg_loss
+
     return {
         "total_trades": total_trades,
         "markets_traded": markets_traded,
@@ -371,6 +419,13 @@ def summarize(
         else None,
         "negative_net_position_markets": negative_net_position_markets,
         "include_unsettled_mtm": include_unsettled_mtm,
+        # 风险回报分析
+        "total_profit_from_wins": total_profit_from_wins,
+        "total_loss_from_losses": total_loss_from_losses,
+        "profit_factor": profit_factor,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "win_loss_ratio": win_loss_ratio,
     }
 
 
@@ -454,6 +509,28 @@ def main() -> None:
     if stats.get("negative_net_position_markets", 0):
         print(f"⚠️ 检测到净持仓为负的市场数（可能为异常/或短仓情况）: {stats['negative_net_position_markets']}")
     print("===============================")
+
+    print("")
+    print("======== 风险回报分析（已结算市场） ========")
+    print(f"总盈利（胜场）：Σ(max(结算价值-成本, 0)) = {stats['total_profit_from_wins']:.6f}")
+    print(f"总亏损（负场）：Σ(成本) = {stats['total_loss_from_losses']:.6f}")
+    if stats.get("profit_factor") is None:
+        print("盈利因子（Profit Factor）: -（没有亏损样本或亏损为 0）")
+    else:
+        print(f"盈利因子（Profit Factor）: {float(stats['profit_factor']):.4f}")
+    if stats.get("avg_win") is not None:
+        print(f"平均盈利（avg_win）: {float(stats['avg_win']):.6f}")
+    else:
+        print("平均盈利（avg_win）: -")
+    if stats.get("avg_loss") is not None:
+        print(f"平均亏损（avg_loss）: {float(stats['avg_loss']):.6f}")
+    else:
+        print("平均亏损（avg_loss）: -")
+    if stats.get("win_loss_ratio") is not None:
+        print(f"盈亏比（avg_win/avg_loss）: {float(stats['win_loss_ratio']):.4f}")
+    else:
+        print("盈亏比（avg_win/avg_loss）: -")
+    print("=========================================")
 
     if args.json_path:
         with open(args.json_path, "w", encoding="utf-8") as f:

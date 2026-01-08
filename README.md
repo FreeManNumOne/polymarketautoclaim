@@ -49,6 +49,11 @@ python3 polymarket_trade_stats.py --since-days 7
 python3 polymarket_trade_stats.py --start "2026-01-01" --end "2026-01-31 23:59:59"
 ```
 
+输出里还包含“风险回报分析”（已结算市场）：
+
+- 盈利因子（Profit Factor）= 总盈利 / 总亏损
+- 平均盈利/平均亏损 与 盈亏比（avg_win/avg_loss）
+
 可选：输出 JSON：
 
 ```bash
