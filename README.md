@@ -54,6 +54,12 @@ python3 polymarket_trade_stats.py --start "2026-01-01" --end "2026-01-31 23:59:5
 - 盈利因子（Profit Factor）= 总盈利 / 总亏损
 - 平均盈利/平均亏损 与 盈亏比（avg_win/avg_loss）
 
+同时也会输出：
+
+- ROI（PnL/总买入成本）
+- 平均入场价格（Avg Entry Price）= 总买入成本 / 总买入份额
+- 最大回撤（Max Drawdown）与最长连胜/连败（按已结算市场按时间排序，逐笔累加PnL得到序列）
+
 可选：输出 JSON：
 
 ```bash

@@ -220,6 +220,7 @@ def summarize(
 
     total_buy_cost = 0.0
     total_sell_proceeds = 0.0
+    total_shares_bought = 0.0
 
     for t in trades:
         cid = t.get("conditionId")
@@ -231,6 +232,11 @@ def summarize(
         size = _parse_float(t.get("size"), default=0.0)
         price = _parse_float(t.get("price"), default=0.0)
         notional = size * price
+        ts_raw = t.get("timestamp")
+        try:
+            ts_i = int(ts_raw)
+        except Exception:
+            ts_i = None
 
         rec = by_condition.setdefault(
             cid,
@@ -240,6 +246,8 @@ def summarize(
                 "ever_bought": set(),  # set(outcome)
                 "buy_cost": 0.0,
                 "sell_proceeds": 0.0,
+                "first_ts": None,
+                "last_ts": None,
                 "sample": {
                     "title": t.get("title"),
                     "slug": t.get("slug"),
@@ -249,10 +257,16 @@ def summarize(
         )
 
         rec["trades"] += 1
+        if ts_i is not None:
+            if rec["first_ts"] is None or ts_i < rec["first_ts"]:
+                rec["first_ts"] = ts_i
+            if rec["last_ts"] is None or ts_i > rec["last_ts"]:
+                rec["last_ts"] = ts_i
 
         if side == "BUY":
             rec["buy_cost"] += notional
             total_buy_cost += notional
+            total_shares_bought += size
         elif side == "SELL":
             rec["sell_proceeds"] += notional
             total_sell_proceeds += notional
@@ -282,6 +296,9 @@ def summarize(
     # 风险回报分析（仅对“已结算且可判定胜负”的市场）
     total_profit_from_wins = 0.0
     total_loss_from_losses = 0.0
+
+    # 时间序列（用于最大回撤、连胜/连败）：以“已结算且可判定胜负”的市场为单位
+    settled_events: List[Tuple[int, float, bool]] = []  # (event_ts, pnl, is_win)
 
     market_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     resolved_cache: Dict[str, Tuple[bool, Optional[str]]] = {}
@@ -346,9 +363,13 @@ def summarize(
             profit = settled_value - net_cost
             if profit > 0:
                 total_profit_from_wins += profit
+            if rec.get("last_ts") is not None:
+                settled_events.append((int(rec["last_ts"]), float(pnl), True))
         elif is_loss:
             loss_cost = net_cost if net_cost > 0 else 0.0
             total_loss_from_losses += abs(loss_cost)
+            if rec.get("last_ts") is not None:
+                settled_events.append((int(rec["last_ts"]), float(pnl), False))
 
         if win_mode == "ever_bought":
             if winning_outcome in rec["ever_bought"]:
@@ -398,6 +419,61 @@ def summarize(
     if avg_win is not None and avg_loss is not None and avg_loss > 0:
         win_loss_ratio = avg_win / avg_loss
 
+    roi = None
+    if total_buy_cost > 0:
+        roi = settled_pnl_total / total_buy_cost
+
+    mtm_roi = None
+    if include_unsettled_mtm and total_buy_cost > 0:
+        mtm_roi = float((total_sell_proceeds - total_buy_cost) + settled_value_total + unsettled_mtm_value_total) / total_buy_cost
+
+    avg_entry_price = None
+    if total_shares_bought > 0:
+        avg_entry_price = total_buy_cost / total_shares_bought
+
+    # 最大回撤 & 连胜/连败（按 settled_events 时间排序）
+    max_drawdown = None
+    max_drawdown_pct = None
+    max_win_streak = None
+    max_loss_streak = None
+    if settled_events:
+        settled_events.sort(key=lambda x: x[0])
+        cum = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        peak_at_max = 0.0
+
+        cur_win = 0
+        cur_loss = 0
+        max_w = 0
+        max_l = 0
+
+        for _, pnl, is_win_ev in settled_events:
+            cum += pnl
+            if cum > peak:
+                peak = cum
+            dd = peak - cum
+            if dd > max_dd:
+                max_dd = dd
+                peak_at_max = peak
+
+            if is_win_ev:
+                cur_win += 1
+                cur_loss = 0
+            else:
+                cur_loss += 1
+                cur_win = 0
+            if cur_win > max_w:
+                max_w = cur_win
+            if cur_loss > max_l:
+                max_l = cur_loss
+
+        max_drawdown = max_dd
+        if peak_at_max > 0:
+            max_drawdown_pct = max_dd / peak_at_max
+        max_win_streak = max_w
+        max_loss_streak = max_l
+
     return {
         "total_trades": total_trades,
         "markets_traded": markets_traded,
@@ -426,6 +502,16 @@ def summarize(
         "avg_win": avg_win,
         "avg_loss": avg_loss,
         "win_loss_ratio": win_loss_ratio,
+        # ROI / 入场均价
+        "roi": roi,
+        "mtm_roi": mtm_roi,
+        "total_shares_bought": total_shares_bought,
+        "avg_entry_price": avg_entry_price,
+        # 回撤 & 连胜连败（以“已结算市场=一笔交易”为单位）
+        "max_drawdown": max_drawdown,
+        "max_drawdown_pct": max_drawdown_pct,
+        "max_win_streak": max_win_streak,
+        "max_loss_streak": max_loss_streak,
     }
 
 
@@ -503,9 +589,19 @@ def main() -> None:
     print(f"净现金流（卖出-买入）: {stats['net_cashflow']:.6f}")
     print(f"已结算市场：结算兑付总价值: {stats['settled_value_total']:.6f}")
     print(f"已结算市场：总盈亏（PnL）: {stats['settled_pnl_total']:.6f}")
+    if stats.get("roi") is not None:
+        print(f"ROI（PnL/总买入成本）: {float(stats['roi'])*100:.2f}%")
+    else:
+        print("ROI（PnL/总买入成本）: -")
+    if stats.get("avg_entry_price") is not None:
+        print(f"平均入场价格（Avg Entry）: {float(stats['avg_entry_price']):.6f}  (总买入成本/总买入份额 {stats['total_shares_bought']:.6f})")
+    else:
+        print("平均入场价格（Avg Entry）: -")
     if stats.get("include_unsettled_mtm"):
         print(f"未结算市场：估值总价值（MTM）: {float(stats['unsettled_mtm_value_total']):.6f}")
         print(f"包含未结算市场：总盈亏（MTM PnL）: {float(stats['mtm_pnl_total']):.6f}")
+        if stats.get("mtm_roi") is not None:
+            print(f"包含未结算市场：ROI（MTM PnL/总买入成本）: {float(stats['mtm_roi'])*100:.2f}%")
     if stats.get("negative_net_position_markets", 0):
         print(f"⚠️ 检测到净持仓为负的市场数（可能为异常/或短仓情况）: {stats['negative_net_position_markets']}")
     print("===============================")
@@ -531,6 +627,25 @@ def main() -> None:
     else:
         print("盈亏比（avg_win/avg_loss）: -")
     print("=========================================")
+
+    print("")
+    print("======== 回撤 / 连胜连败（已结算市场按时间排序） ========")
+    if stats.get("max_drawdown") is None:
+        print("最大回撤（Max Drawdown）: -")
+    else:
+        s = f"{float(stats['max_drawdown']):.6f}"
+        if stats.get("max_drawdown_pct") is not None:
+            s += f"  ({float(stats['max_drawdown_pct'])*100:.2f}%)"
+        print(f"最大回撤（Max Drawdown）: {s}")
+    if stats.get("max_win_streak") is not None:
+        print(f"最长连胜（Max Win Streak）: {int(stats['max_win_streak'])}")
+    else:
+        print("最长连胜（Max Win Streak）: -")
+    if stats.get("max_loss_streak") is not None:
+        print(f"最长连败（Max Loss Streak）: {int(stats['max_loss_streak'])}")
+    else:
+        print("最长连败（Max Loss Streak）: -")
+    print("==============================================")
 
     if args.json_path:
         with open(args.json_path, "w", encoding="utf-8") as f:
