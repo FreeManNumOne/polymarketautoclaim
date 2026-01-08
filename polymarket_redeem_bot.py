@@ -99,9 +99,17 @@ def get_redeemable_markets(proxy_address: str):
         response.raise_for_status()
         data = response.json()
         conditions = set()
+        skipped_lost = 0
         for item in data:
+            # 过滤掉 outcome 标记为 LOST 的仓位（通常代表输的那一侧，redeem 可能会 0 回报但消耗 gas）
+            outcome = str(item.get("outcome", "")).strip().upper()
+            if outcome == "LOST":
+                skipped_lost += 1
+                continue
             if float(item.get("size", 0)) > 0:
                 conditions.add(item.get("conditionId"))
+        if skipped_lost:
+            log(f"🧹 已过滤 outcome=LOST 的仓位数量: {skipped_lost}")
         return list(conditions)
     except Exception as e:
         log(f"⚠️ Polymarket API 报错（稍后再试即可）：{e}")
