@@ -92,12 +92,26 @@ def infer_winning_outcome(market: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     - market.closed == True
     - outcomePrices 中最大值接近 1，最小值接近 0
     """
+    def _coerce_json_list(x: Any) -> Optional[List[Any]]:
+        # gamma API 有时会把数组字段序列化成字符串，例如 '["Up","Down"]'
+        if isinstance(x, list):
+            return x
+        if isinstance(x, str):
+            s = x.strip()
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    v = json.loads(s)
+                    return v if isinstance(v, list) else None
+                except Exception:
+                    return None
+        return None
+
     if market.get("closed") is not True:
         return False, None
 
-    outcomes = market.get("outcomes") or []
-    prices_raw = market.get("outcomePrices") or []
-    if not isinstance(outcomes, list) or not isinstance(prices_raw, list) or len(outcomes) != len(prices_raw):
+    outcomes = _coerce_json_list(market.get("outcomes")) or []
+    prices_raw = _coerce_json_list(market.get("outcomePrices")) or []
+    if not outcomes or not prices_raw or len(outcomes) != len(prices_raw):
         return False, None
 
     prices = [_parse_float(p, default=0.0) for p in prices_raw]
