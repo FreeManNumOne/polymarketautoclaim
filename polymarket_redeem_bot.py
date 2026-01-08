@@ -101,20 +101,13 @@ def get_redeemable_markets(proxy_address: str):
         conditions = set()
         skipped_not_won = 0
         for item in data:
-            # 只领取“已获胜”的仓位：
-            # 在 positions API 中，获胜仓位通常满足：
-            # - curPrice == 1（已结算且该 outcome 获胜）
-            # - 或 currentValue > 0（有可赎回价值）
+            # 只领取“结算后为 1”的获胜仓位：
+            # 在 positions API 中，获胜 outcome 结算后 curPrice 会为 1。
             try:
                 cur_price = float(item.get("curPrice", 0) or 0)
             except Exception:
                 cur_price = 0.0
-            try:
-                current_value = float(item.get("currentValue", 0) or 0)
-            except Exception:
-                current_value = 0.0
-
-            won = (cur_price >= 0.999) or (current_value > 0)
+            won = cur_price >= 0.999
             if not won:
                 skipped_not_won += 1
                 continue
