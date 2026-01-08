@@ -99,17 +99,30 @@ def get_redeemable_markets(proxy_address: str):
         response.raise_for_status()
         data = response.json()
         conditions = set()
-        skipped_lost = 0
+        skipped_not_won = 0
         for item in data:
-            # 过滤掉 outcome 标记为 LOST 的仓位（通常代表输的那一侧，redeem 可能会 0 回报但消耗 gas）
-            outcome = str(item.get("outcome", "")).strip().upper()
-            if outcome == "LOST":
-                skipped_lost += 1
+            # 只领取“已获胜”的仓位：
+            # 在 positions API 中，获胜仓位通常满足：
+            # - curPrice == 1（已结算且该 outcome 获胜）
+            # - 或 currentValue > 0（有可赎回价值）
+            try:
+                cur_price = float(item.get("curPrice", 0) or 0)
+            except Exception:
+                cur_price = 0.0
+            try:
+                current_value = float(item.get("currentValue", 0) or 0)
+            except Exception:
+                current_value = 0.0
+
+            won = (cur_price >= 0.999) or (current_value > 0)
+            if not won:
+                skipped_not_won += 1
                 continue
+
             if float(item.get("size", 0)) > 0:
                 conditions.add(item.get("conditionId"))
-        if skipped_lost:
-            log(f"🧹 已过滤 outcome=LOST 的仓位数量: {skipped_lost}")
+        if skipped_not_won:
+            log(f"🧹 已过滤未获胜/无价值仓位数量: {skipped_not_won}")
         return list(conditions)
     except Exception as e:
         log(f"⚠️ Polymarket API 报错（稍后再试即可）：{e}")
