@@ -2,7 +2,7 @@ import argparse
 import datetime as dt
 import json
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -84,6 +84,31 @@ def fetch_market_by_condition_id(condition_id: str, *, timeout_s: int = 20) -> O
     return data[0]
 
 
+def _coerce_json_list(x: Any) -> Optional[List[Any]]:
+    # gamma API 有时会把数组字段序列化成字符串，例如 '["Up","Down"]'
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                v = json.loads(s)
+                return v if isinstance(v, list) else None
+            except Exception:
+                return None
+    return None
+
+
+def _extract_outcomes_and_prices(market: Dict[str, Any]) -> Tuple[List[str], List[float]]:
+    outcomes_any = _coerce_json_list(market.get("outcomes")) or []
+    prices_any = _coerce_json_list(market.get("outcomePrices")) or []
+    if not outcomes_any or not prices_any or len(outcomes_any) != len(prices_any):
+        return [], []
+    outcomes = [str(x) for x in outcomes_any]
+    prices = [_parse_float(p, default=0.0) for p in prices_any]
+    return outcomes, prices
+
+
 def infer_winning_outcome(market: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     基于 outcomePrices 推断是否“已结算”，以及胜出的 outcome 文本（例如 "Yes"/"No"）。
@@ -92,30 +117,11 @@ def infer_winning_outcome(market: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     - market.closed == True
     - outcomePrices 中最大值接近 1，最小值接近 0
     """
-    def _coerce_json_list(x: Any) -> Optional[List[Any]]:
-        # gamma API 有时会把数组字段序列化成字符串，例如 '["Up","Down"]'
-        if isinstance(x, list):
-            return x
-        if isinstance(x, str):
-            s = x.strip()
-            if s.startswith("[") and s.endswith("]"):
-                try:
-                    v = json.loads(s)
-                    return v if isinstance(v, list) else None
-                except Exception:
-                    return None
-        return None
-
     if market.get("closed") is not True:
         return False, None
 
-    outcomes = _coerce_json_list(market.get("outcomes")) or []
-    prices_raw = _coerce_json_list(market.get("outcomePrices")) or []
-    if not outcomes or not prices_raw or len(outcomes) != len(prices_raw):
-        return False, None
-
-    prices = [_parse_float(p, default=0.0) for p in prices_raw]
-    if not prices:
+    outcomes, prices = _extract_outcomes_and_prices(market)
+    if not outcomes or not prices:
         return False, None
 
     max_i = max(range(len(prices)), key=lambda i: prices[i])
@@ -135,6 +141,7 @@ def summarize(
     win_mode: str = "net_position",
     gamma_timeout_s: int = 20,
     progress_every: int = 100,
+    include_unsettled_mtm: bool = False,
 ) -> Dict[str, Any]:
     """
     输出统计口径：
@@ -150,6 +157,9 @@ def summarize(
 
     by_condition: Dict[str, Dict[str, Any]] = {}
 
+    total_buy_cost = 0.0
+    total_sell_proceeds = 0.0
+
     for t in trades:
         cid = t.get("conditionId")
         if not cid:
@@ -158,6 +168,8 @@ def summarize(
         outcome = str(t.get("outcome") or "")
         side = str(t.get("side") or "").upper()
         size = _parse_float(t.get("size"), default=0.0)
+        price = _parse_float(t.get("price"), default=0.0)
+        notional = size * price
 
         rec = by_condition.setdefault(
             cid,
@@ -165,6 +177,8 @@ def summarize(
                 "trades": 0,
                 "net_shares_by_outcome": {},  # outcome -> float
                 "ever_bought": set(),  # set(outcome)
+                "buy_cost": 0.0,
+                "sell_proceeds": 0.0,
                 "sample": {
                     "title": t.get("title"),
                     "slug": t.get("slug"),
@@ -174,6 +188,13 @@ def summarize(
         )
 
         rec["trades"] += 1
+
+        if side == "BUY":
+            rec["buy_cost"] += notional
+            total_buy_cost += notional
+        elif side == "SELL":
+            rec["sell_proceeds"] += notional
+            total_sell_proceeds += notional
 
         if outcome:
             net_map: Dict[str, float] = rec["net_shares_by_outcome"]
@@ -191,6 +212,11 @@ def summarize(
     losses = 0
     unsettled_or_unknown = 0
     no_position = 0
+    negative_net_position_markets = 0
+
+    settled_value_total = 0.0
+    settled_pnl_total = 0.0
+    unsettled_mtm_value_total = 0.0
 
     market_cache: Dict[str, Optional[Dict[str, Any]]] = {}
     resolved_cache: Dict[str, Tuple[bool, Optional[str]]] = {}
@@ -209,9 +235,27 @@ def summarize(
         if cid not in resolved_cache:
             resolved_cache[cid] = infer_winning_outcome(market)
         resolved, winning_outcome = resolved_cache[cid]
+        outcomes, prices = _extract_outcomes_and_prices(market)
+
+        cashflow = float(rec["sell_proceeds"]) - float(rec["buy_cost"])
+
         if not resolved or not winning_outcome:
-            unsettled_or_unknown += 1
+            if include_unsettled_mtm and outcomes and prices:
+                price_by_outcome = {o: p for o, p in zip(outcomes, prices)}
+                mtm_value = 0.0
+                for o, shares in rec["net_shares_by_outcome"].items():
+                    mtm_value += float(shares) * float(price_by_outcome.get(o, 0.0))
+                unsettled_mtm_value_total += mtm_value
+            else:
+                unsettled_or_unknown += 1
             continue
+
+        net_map = rec["net_shares_by_outcome"]
+        winning_shares = float(net_map.get(winning_outcome, 0.0))
+        settled_value = winning_shares * 1.0
+        pnl = cashflow + settled_value
+        settled_value_total += settled_value
+        settled_pnl_total += pnl
 
         if win_mode == "ever_bought":
             if winning_outcome in rec["ever_bought"]:
@@ -221,7 +265,6 @@ def summarize(
             continue
 
         # net_position
-        net_map = rec["net_shares_by_outcome"]
         if not net_map:
             no_position += 1
             continue
@@ -229,6 +272,8 @@ def summarize(
         # 找到净持仓最大的 outcome，作为“你站的方向”
         best_outcome, best_shares = max(net_map.items(), key=lambda kv: kv[1])
         if best_shares <= 0:
+            if best_shares < 0:
+                negative_net_position_markets += 1
             no_position += 1
             continue
 
@@ -248,6 +293,17 @@ def summarize(
         "no_position": no_position,
         "unsettled_or_unknown": unsettled_or_unknown,
         "win_mode": win_mode,
+        "total_buy_cost": total_buy_cost,
+        "total_sell_proceeds": total_sell_proceeds,
+        "net_cashflow": total_sell_proceeds - total_buy_cost,
+        "settled_value_total": settled_value_total,
+        "settled_pnl_total": settled_pnl_total,
+        "unsettled_mtm_value_total": unsettled_mtm_value_total if include_unsettled_mtm else None,
+        "mtm_pnl_total": (total_sell_proceeds - total_buy_cost) + settled_value_total + unsettled_mtm_value_total
+        if include_unsettled_mtm
+        else None,
+        "negative_net_position_markets": negative_net_position_markets,
+        "include_unsettled_mtm": include_unsettled_mtm,
     }
 
 
@@ -263,6 +319,11 @@ def main() -> None:
         help="胜负判定口径：net_position（默认）或 ever_bought（更宽松）",
     )
     parser.add_argument("--progress-every", type=int, default=100, help="每处理多少个市场打印一次进度（默认 100；设为 0 关闭）")
+    parser.add_argument(
+        "--include-unsettled-mtm",
+        action="store_true",
+        help="可选：对未结算市场按 gamma 当前 outcomePrices 做估值（mark-to-market），并给出包含未结算的总盈亏",
+    )
     parser.add_argument("--json", dest="json_path", default=None, help="可选：把统计结果写入 JSON 文件")
     args = parser.parse_args()
 
@@ -277,7 +338,12 @@ def main() -> None:
     trades = fetch_all_trades(user, limit=args.limit, max_trades=args.max_trades)
     log(f"已拉取 trades 条数: {len(trades)}")
 
-    stats = summarize(trades, win_mode=args.win_mode, progress_every=args.progress_every)
+    stats = summarize(
+        trades,
+        win_mode=args.win_mode,
+        progress_every=args.progress_every,
+        include_unsettled_mtm=bool(args.include_unsettled_mtm),
+    )
 
     print("")
     print("======== 统计结果 ========")
@@ -290,6 +356,20 @@ def main() -> None:
     print(f"未结算或无法获取（gamma 无法确认）: {stats['unsettled_or_unknown']}")
     print(f"胜负口径（win_mode）: {stats['win_mode']}")
     print("==========================")
+
+    print("")
+    print("======== 资金统计（USDC） ========")
+    print(f"总买入成本（BUY size*price）: {stats['total_buy_cost']:.6f}")
+    print(f"总卖出回款（SELL size*price）: {stats['total_sell_proceeds']:.6f}")
+    print(f"净现金流（卖出-买入）: {stats['net_cashflow']:.6f}")
+    print(f"已结算市场：结算兑付总价值: {stats['settled_value_total']:.6f}")
+    print(f"已结算市场：总盈亏（PnL）: {stats['settled_pnl_total']:.6f}")
+    if stats.get("include_unsettled_mtm"):
+        print(f"未结算市场：估值总价值（MTM）: {float(stats['unsettled_mtm_value_total']):.6f}")
+        print(f"包含未结算市场：总盈亏（MTM PnL）: {float(stats['mtm_pnl_total']):.6f}")
+    if stats.get("negative_net_position_markets", 0):
+        print(f"⚠️ 检测到净持仓为负的市场数（可能为异常/或短仓情况）: {stats['negative_net_position_markets']}")
+    print("===============================")
 
     if args.json_path:
         with open(args.json_path, "w", encoding="utf-8") as f:

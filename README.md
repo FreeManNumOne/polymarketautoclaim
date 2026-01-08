@@ -33,6 +33,12 @@ python3 polymarket_trade_stats.py --win-mode net_position
 python3 polymarket_trade_stats.py --win-mode ever_bought
 ```
 
+可选：对未结算市场做估值（mark-to-market），输出包含未结算的总盈亏：
+
+```bash
+python3 polymarket_trade_stats.py --include-unsettled-mtm
+```
+
 可选：输出 JSON：
 
 ```bash
