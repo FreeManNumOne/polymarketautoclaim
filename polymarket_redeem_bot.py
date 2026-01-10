@@ -350,11 +350,13 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str, index_sets: list[int]
             owner_contract = w3.eth.contract(address=owner_contract_addr, abi=WALLET_PROXY_ABI)
             wallet = w3.eth.contract(address=proxy_addr, abi=WALLET_PROXY_ABI)
 
-            # wallet.proxy([ (0, CTF, 0, ctf_data) ])
-            wallet_proxy_data = wallet.functions.proxy([(0, ctf_addr, 0, bytes.fromhex(ctf_data[2:]))])._encode_transaction_data()
+            # wallet.proxy([ (operation, CTF, 0, ctf_data) ])
+            # 注意：该合约钱包的 operation 枚举中，1 才表示普通 CALL（0 会导致内部调用以 delegatecall 等方式执行，从而 revert）
+            wallet_proxy_data = wallet.functions.proxy([(1, ctf_addr, 0, bytes.fromhex(ctf_data[2:]))])._encode_transaction_data()
 
-            # owner.proxy([ (0, wallet, 0, wallet_proxy_data) ])
-            tx_call = owner_contract.functions.proxy([(0, proxy_addr, 0, bytes.fromhex(wallet_proxy_data[2:]))])
+            # owner.proxy([ (operation, wallet, 0, wallet_proxy_data) ])
+            # owner 合约这里的 operation=2 才是普通 CALL（0/1 会导致 delegatecall/权限错误）
+            tx_call = owner_contract.functions.proxy([(2, proxy_addr, 0, bytes.fromhex(wallet_proxy_data[2:]))])
 
         # 4) build + 估算 gas + 签名 + 发送
         tx = tx_call.build_transaction(
