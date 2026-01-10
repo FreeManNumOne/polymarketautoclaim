@@ -3,7 +3,7 @@ import requests
 import datetime
 from web3 import Web3
 from eth_account import Account
-from eth_account.messages import encode_defunct
+from typing import Optional
 from dotenv import load_dotenv
 import os
 import multiprocessing as mp
@@ -33,6 +33,13 @@ RUN_TIMEOUT_SECONDS = int(os.getenv("RUN_TIMEOUT_SECONDS", "180"))
 
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+# Polymarket email/Builder 合约钱包（当前观察到的实现）会把“owner 合约地址”存到一个固定 slot。
+# 该 slot 来自钱包实现合约中的 PUSH32 常量（链上可验证）。
+WALLET_OWNER_SLOT = int(
+    "0x734a2a5caf82146a5ddd5263d9af379f9f72724959f0567ddc9df2c40cf2cc20",
+    16,
+)
 
 CTF_ABI = [
     {
@@ -201,6 +208,22 @@ def rpc_healthcheck(rpc_url: str, timeout_s: int = 10) -> bool:
         return False
 
 
+def _is_contract(w3: Web3, addr: str) -> bool:
+    code = w3.eth.get_code(Web3.to_checksum_address(addr))
+    return bool(code and len(code) > 0)
+
+
+def _get_wallet_owner_contract(w3: Web3, wallet_addr: str) -> Optional[str]:
+    """
+    对 Polymarket email/Builder 合约钱包：读取固定 slot 得到 owner 合约地址。
+    若 slot 为 0，返回 None。
+    """
+    v = w3.eth.get_storage_at(Web3.to_checksum_address(wallet_addr), WALLET_OWNER_SLOT)
+    if not v or int.from_bytes(v, "big") == 0:
+        return None
+    return Web3.to_checksum_address("0x" + v.hex()[-40:])
+
+
 def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
     # web3.py v7 默认只接受 checksum address；为了兼容你在 .env 里配置小写地址，这里统一转换
     try:
@@ -214,30 +237,14 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
     except Exception as e:
         raise ValueError("脚本内置合约地址无法转换为 checksum（异常情况）") from e
 
-    proxy = w3.eth.contract(address=proxy_addr, abi=SAFE_ABI)
     ctf = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
 
     log(f"⚙️ 准备领取 conditionId: {condition_id}")
 
     try:
-        # -------- Safe 基础检查：是否单签、owner 是否匹配 --------
-        call_from = {"from": account.address}
-        try:
-            # 有些合约/代理会对 eth_call 的 msg.sender 做限制；显式带上 from=owner
-            threshold = int(proxy.functions.getThreshold().call(call_from))
-            owners = proxy.functions.getOwners().call(call_from)
-        except Exception as e:
-            raise RuntimeError(f"无法读取 Safe 信息（getThreshold/getOwners）：{e}") from e
-
-        owner_set = {Web3.to_checksum_address(o) for o in owners}
-        if Web3.to_checksum_address(account.address) not in owner_set:
-            raise RuntimeError(f"当前私钥地址不在 Safe owners 中：{account.address}")
-        if threshold != 1:
-            raise RuntimeError(f"该 Safe 阈值为 {threshold}（多签），脚本目前只支持阈值=1 的单签执行。")
-
         cond_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
 
-        # 1) 生成对 CTF.redeemPositions 的 calldata（仅用于拿到 data）
+        # 1) 生成对 CTF.redeemPositions 的 calldata
         ctf_tx_dummy = ctf.functions.redeemPositions(
             usdc_addr,
             b"\x00" * 32,
@@ -253,43 +260,35 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
         )
         ctf_data = ctf_tx_dummy["data"]
 
-        # 2) 生成 Safe 所需签名：按 Safe.getTransactionHash + EOA 签名
-        zero_addr = "0x0000000000000000000000000000000000000000"
-        safe_tx_gas = 0
-        base_gas = 0
-        gas_price = 0
-        operation = 0
-        safe_nonce = int(proxy.functions.nonce().call(call_from))
+        # 2) 根据 PM_ADDRESS 类型选择执行路径：
+        # - EOA：直接从 EOA 调用 CTF.redeemPositions
+        # - 合约钱包（email/builder）：EOA -> ownerContract.proxy([ wallet.proxy([ CTF.call ]) ])
+        if not _is_contract(w3, proxy_addr):
+            log("🧾 PM_ADDRESS 为 EOA，直接发起 redeemPositions。")
+            tx_call = ctf.functions.redeemPositions(
+                usdc_addr,
+                b"\x00" * 32,
+                cond_id_bytes,
+                [1, 2],
+            )
+        else:
+            owner_contract_addr = _get_wallet_owner_contract(w3, proxy_addr)
+            if not owner_contract_addr:
+                raise RuntimeError(
+                    "检测到 PM_ADDRESS 为合约钱包，但无法从预期 slot 读取 owner 合约地址。"
+                    "这可能意味着 Polymarket 钱包实现已升级，需要更新脚本的解析逻辑。"
+                )
 
-        safe_tx_hash = proxy.functions.getTransactionHash(
-            ctf_addr,
-            0,
-            ctf_data,
-            operation,
-            safe_tx_gas,
-            base_gas,
-            gas_price,
-            zero_addr,
-            zero_addr,
-            safe_nonce,
-        ).call(call_from)
+            log(f"🔐 合约钱包 owner 合约: {owner_contract_addr}")
 
-        signed = account.sign_message(encode_defunct(primitive=safe_tx_hash))
-        signatures = signed.signature
+            owner_contract = w3.eth.contract(address=owner_contract_addr, abi=WALLET_PROXY_ABI)
+            wallet = w3.eth.contract(address=proxy_addr, abi=WALLET_PROXY_ABI)
 
-        # 3) Proxy(Safe).execTransaction 调用
-        tx_call = proxy.functions.execTransaction(
-            ctf_addr,
-            0,
-            ctf_data,
-            0,
-            0,
-            0,
-            0,
-            zero_addr,
-            zero_addr,
-            signatures,
-        )
+            # wallet.proxy([ (0, CTF, 0, ctf_data) ])
+            wallet_proxy_data = wallet.functions.proxy([(0, ctf_addr, 0, bytes.fromhex(ctf_data[2:]))])._encode_transaction_data()
+
+            # owner.proxy([ (0, wallet, 0, wallet_proxy_data) ])
+            tx_call = owner_contract.functions.proxy([(0, proxy_addr, 0, bytes.fromhex(wallet_proxy_data[2:]))])
 
         # 4) build + 估算 gas + 签名 + 发送
         tx = tx_call.build_transaction(
