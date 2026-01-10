@@ -3,6 +3,7 @@ import requests
 import datetime
 from web3 import Web3
 from eth_account import Account
+from eth_account.messages import encode_defunct
 from dotenv import load_dotenv
 import os
 import multiprocessing as mp
@@ -69,6 +70,46 @@ SAFE_ABI = [
         "stateMutability": "payable",
         "type": "function",
     }
+    ,
+    {
+        "inputs": [],
+        "name": "nonce",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "getOwners",
+        "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "getThreshold",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "to", "type": "address"},
+            {"internalType": "uint256", "name": "value", "type": "uint256"},
+            {"internalType": "bytes", "name": "data", "type": "bytes"},
+            {"internalType": "enum Enum.Operation", "name": "operation", "type": "uint8"},
+            {"internalType": "uint256", "name": "safeTxGas", "type": "uint256"},
+            {"internalType": "uint256", "name": "baseGas", "type": "uint256"},
+            {"internalType": "uint256", "name": "gasPrice", "type": "uint256"},
+            {"internalType": "address", "name": "gasToken", "type": "address"},
+            {"internalType": "address", "name": "refundReceiver", "type": "address"},
+            {"internalType": "uint256", "name": "_nonce", "type": "uint256"},
+        ],
+        "name": "getTransactionHash",
+        "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 
@@ -157,6 +198,19 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
     log(f"⚙️ 准备领取 conditionId: {condition_id}")
 
     try:
+        # -------- Safe 基础检查：是否单签、owner 是否匹配 --------
+        try:
+            threshold = int(proxy.functions.getThreshold().call())
+            owners = proxy.functions.getOwners().call()
+        except Exception as e:
+            raise RuntimeError(f"无法读取 Safe 信息（getThreshold/getOwners）：{e}") from e
+
+        owner_set = {Web3.to_checksum_address(o) for o in owners}
+        if Web3.to_checksum_address(account.address) not in owner_set:
+            raise RuntimeError(f"当前私钥地址不在 Safe owners 中：{account.address}")
+        if threshold != 1:
+            raise RuntimeError(f"该 Safe 阈值为 {threshold}（多签），脚本目前只支持阈值=1 的单签执行。")
+
         cond_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
 
         # 1) 生成对 CTF.redeemPositions 的 calldata（仅用于拿到 data）
@@ -175,9 +229,29 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
         )
         ctf_data = ctf_tx_dummy["data"]
 
-        # 2) 生成 Safe 所需 signatures（此处按原脚本方式构造）
-        owner_int = int(account.address, 16)
-        signature = owner_int.to_bytes(32, "big") + (0).to_bytes(32, "big") + (1).to_bytes(1, "big")
+        # 2) 生成 Safe 所需签名：按 Safe.getTransactionHash + EOA 签名
+        zero_addr = "0x0000000000000000000000000000000000000000"
+        safe_tx_gas = 0
+        base_gas = 0
+        gas_price = 0
+        operation = 0
+        safe_nonce = int(proxy.functions.nonce().call())
+
+        safe_tx_hash = proxy.functions.getTransactionHash(
+            ctf_addr,
+            0,
+            ctf_data,
+            operation,
+            safe_tx_gas,
+            base_gas,
+            gas_price,
+            zero_addr,
+            zero_addr,
+            safe_nonce,
+        ).call()
+
+        signed = account.sign_message(encode_defunct(primitive=safe_tx_hash))
+        signatures = signed.signature
 
         # 3) Proxy(Safe).execTransaction 调用
         tx_call = proxy.functions.execTransaction(
@@ -188,9 +262,9 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
             0,
             0,
             0,
-            "0x0000000000000000000000000000000000000000",
-            "0x0000000000000000000000000000000000000000",
-            signature,
+            zero_addr,
+            zero_addr,
+            signatures,
         )
 
         # 4) build + 估算 gas + 签名 + 发送
