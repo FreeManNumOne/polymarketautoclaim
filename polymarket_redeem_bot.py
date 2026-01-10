@@ -159,7 +159,11 @@ def get_raw_tx_bytes(signed_tx):
     return signed_tx[0] if isinstance(signed_tx, (tuple, list)) else signed_tx
 
 
-def get_redeemable_markets(proxy_address: str):
+def get_redeemable_positions(proxy_address: str):
+    """
+    返回可领取（redeemable=true）且已获胜（curPrice≈1）的仓位列表。
+    同时根据 outcomeIndex 推导 indexSet，避免对没持仓的 indexSet 调用 redeemPositions 触发 revert。
+    """
     log("🔍 通过 API 检查可领取（redeemable）的仓位...")
     url = "https://data-api.polymarket.com/positions"
     params = {"user": proxy_address, "redeemable": "true", "limit": 50}
@@ -168,11 +172,12 @@ def get_redeemable_markets(proxy_address: str):
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        conditions = set()
+
+        out = []
         skipped_not_won = 0
+        skipped_bad = 0
+
         for item in data:
-            # 只领取“结算后为 1”的获胜仓位：
-            # 在 positions API 中，获胜 outcome 结算后 curPrice 会为 1。
             try:
                 cur_price = float(item.get("curPrice", 0) or 0)
             except Exception:
@@ -182,11 +187,73 @@ def get_redeemable_markets(proxy_address: str):
                 skipped_not_won += 1
                 continue
 
-            if float(item.get("size", 0)) > 0:
-                conditions.add(item.get("conditionId"))
+            try:
+                size = float(item.get("size", 0) or 0)
+            except Exception:
+                size = 0.0
+            if size <= 0:
+                continue
+
+            condition_id = item.get("conditionId")
+            outcome_index = item.get("outcomeIndex")
+            if not condition_id or outcome_index is None:
+                skipped_bad += 1
+                continue
+
+            try:
+                outcome_index_int = int(outcome_index)
+                index_set = 1 << outcome_index_int
+            except Exception:
+                skipped_bad += 1
+                continue
+
+            out.append(
+                {
+                    "conditionId": condition_id,
+                    "outcomeIndex": outcome_index_int,
+                    "indexSet": index_set,
+                    "size": size,
+                    "title": item.get("title"),
+                    "outcome": item.get("outcome"),
+                }
+            )
+
         if skipped_not_won:
             log(f"🧹 已过滤未获胜/无价值仓位数量: {skipped_not_won}")
-        return list(conditions)
+        if skipped_bad:
+            log(f"🧹 已跳过缺少字段/无法解析的仓位数量: {skipped_bad}")
+
+        # 按 conditionId 合并（同一市场可能出现多条）
+        merged = {}
+        for p in out:
+            cid = p["conditionId"]
+            rec = merged.setdefault(
+                cid,
+                {
+                    "conditionId": cid,
+                    "indexSets": set(),
+                    "titles": set(),
+                    "outcomes": set(),
+                },
+            )
+            rec["indexSets"].add(int(p["indexSet"]))
+            if p.get("title"):
+                rec["titles"].add(p["title"])
+            if p.get("outcome"):
+                rec["outcomes"].add(p["outcome"])
+
+        result = []
+        for cid, rec in merged.items():
+            result.append(
+                {
+                    "conditionId": cid,
+                    "indexSets": sorted(list(rec["indexSets"])),
+                    "title": next(iter(rec["titles"]), None),
+                    "outcome": next(iter(rec["outcomes"]), None),
+                }
+            )
+
+        return result
     except Exception as e:
         log(f"⚠️ Polymarket API 报错（稍后再试即可）：{e}")
         return []
@@ -224,7 +291,7 @@ def _get_wallet_owner_contract(w3: Web3, wallet_addr: str) -> Optional[str]:
     return Web3.to_checksum_address("0x" + v.hex()[-40:])
 
 
-def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
+def redeem_via_proxy(w3: Web3, account, condition_id: str, index_sets: list[int]) -> None:
     # web3.py v7 默认只接受 checksum address；为了兼容你在 .env 里配置小写地址，这里统一转换
     try:
         proxy_addr = Web3.to_checksum_address(PROXY_ADDRESS)
@@ -239,7 +306,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
 
     ctf = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
 
-    log(f"⚙️ 准备领取 conditionId: {condition_id}")
+    log(f"⚙️ 准备领取 conditionId: {condition_id} indexSets={index_sets}")
 
     try:
         cond_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
@@ -249,7 +316,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
             usdc_addr,
             b"\x00" * 32,
             cond_id_bytes,
-            [1, 2],
+            index_sets,
         ).build_transaction(
             {
                 "chainId": 137,
@@ -269,7 +336,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
                 usdc_addr,
                 b"\x00" * 32,
                 cond_id_bytes,
-                [1, 2],
+                index_sets,
             )
         else:
             owner_contract_addr = _get_wallet_owner_contract(w3, proxy_addr)
@@ -373,14 +440,16 @@ def run_cycle() -> None:
     except Exception:
         pass
 
-    conditions = get_redeemable_markets(PROXY_ADDRESS)
-    if not conditions:
+    redeemables = get_redeemable_positions(PROXY_ADDRESS)
+    if not redeemables:
         log("未发现可领取仓位。")
         return
 
-    log(f"🔥 发现可领取 markets 数量: {len(conditions)}")
-    for cond in conditions:
-        redeem_via_proxy(w3, account, cond)
+    log(f"🔥 发现可领取 markets 数量: {len(redeemables)}")
+    for item in redeemables:
+        cond = item["conditionId"]
+        idx_sets = item.get("indexSets") or [1, 2]
+        redeem_via_proxy(w3, account, cond, idx_sets)
         time.sleep(3)  # 避免 nonce/网络延迟导致冲突
 
 
