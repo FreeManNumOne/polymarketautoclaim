@@ -139,8 +139,20 @@ def rpc_healthcheck(rpc_url: str, timeout_s: int = 10) -> bool:
 
 
 def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
-    proxy = w3.eth.contract(address=PROXY_ADDRESS, abi=SAFE_ABI)
-    ctf = w3.eth.contract(address=CTF_ADDRESS, abi=CTF_ABI)
+    # web3.py v7 默认只接受 checksum address；为了兼容你在 .env 里配置小写地址，这里统一转换
+    try:
+        proxy_addr = Web3.to_checksum_address(PROXY_ADDRESS)
+    except Exception as e:
+        raise ValueError(f"PM_ADDRESS 不是合法地址或无法转换为 checksum：{PROXY_ADDRESS}") from e
+
+    try:
+        ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
+        usdc_addr = Web3.to_checksum_address(USDC_ADDRESS)
+    except Exception as e:
+        raise ValueError("脚本内置合约地址无法转换为 checksum（异常情况）") from e
+
+    proxy = w3.eth.contract(address=proxy_addr, abi=SAFE_ABI)
+    ctf = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
 
     log(f"⚙️ 准备领取 conditionId: {condition_id}")
 
@@ -149,7 +161,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
 
         # 1) 生成对 CTF.redeemPositions 的 calldata（仅用于拿到 data）
         ctf_tx_dummy = ctf.functions.redeemPositions(
-            USDC_ADDRESS,
+            usdc_addr,
             b"\x00" * 32,
             cond_id_bytes,
             [1, 2],
@@ -169,7 +181,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
 
         # 3) Proxy(Safe).execTransaction 调用
         tx_call = proxy.functions.execTransaction(
-            CTF_ADDRESS,
+            ctf_addr,
             0,
             ctf_data,
             0,
