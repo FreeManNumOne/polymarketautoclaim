@@ -199,9 +199,11 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
 
     try:
         # -------- Safe 基础检查：是否单签、owner 是否匹配 --------
+        call_from = {"from": account.address}
         try:
-            threshold = int(proxy.functions.getThreshold().call())
-            owners = proxy.functions.getOwners().call()
+            # 有些合约/代理会对 eth_call 的 msg.sender 做限制；显式带上 from=owner
+            threshold = int(proxy.functions.getThreshold().call(call_from))
+            owners = proxy.functions.getOwners().call(call_from)
         except Exception as e:
             raise RuntimeError(f"无法读取 Safe 信息（getThreshold/getOwners）：{e}") from e
 
@@ -235,7 +237,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
         base_gas = 0
         gas_price = 0
         operation = 0
-        safe_nonce = int(proxy.functions.nonce().call())
+        safe_nonce = int(proxy.functions.nonce().call(call_from))
 
         safe_tx_hash = proxy.functions.getTransactionHash(
             ctf_addr,
@@ -248,7 +250,7 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str) -> None:
             zero_addr,
             zero_addr,
             safe_nonce,
-        ).call()
+        ).call(call_from)
 
         signed = account.sign_message(encode_defunct(primitive=safe_tx_hash))
         signatures = signed.signature
