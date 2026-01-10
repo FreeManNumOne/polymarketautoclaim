@@ -23,6 +23,11 @@ PROXY_ADDRESS = os.getenv("PM_ADDRESS")
 # 建议使用 Alchemy/Infura 等更稳定的 RPC
 RPC_URL = "https://polygon-rpc.com"
 
+# 是否自动领取“输掉的仓位”（curPrice≈0）：
+# - 默认 False：避免花 gas 去领取 0
+# - 如果你希望把输仓也一并 redeem（有些情况下用于清理仓位/解锁状态），设为 true
+REDEEM_LOSING_POSITIONS = os.getenv("REDEEM_LOSING_POSITIONS", "false").strip().lower() in ("1", "true", "yes", "y")
+
 # 检查间隔（秒）(15 分钟 = 900 秒)
 CHECK_INTERVAL = 5 * 60
 
@@ -161,7 +166,7 @@ def get_raw_tx_bytes(signed_tx):
 
 def get_redeemable_positions(proxy_address: str):
     """
-    返回可领取（redeemable=true）且已获胜（curPrice≈1）的仓位列表。
+    返回可领取（redeemable=true）的仓位列表（包含赢/输两种情况）。
     同时根据 outcomeIndex 推导 indexSet，避免对没持仓的 indexSet 调用 redeemPositions 触发 revert。
     """
     log("🔍 通过 API 检查可领取（redeemable）的仓位...")
@@ -174,7 +179,6 @@ def get_redeemable_positions(proxy_address: str):
         data = response.json()
 
         out = []
-        skipped_not_won = 0
         skipped_bad = 0
 
         for item in data:
@@ -182,10 +186,6 @@ def get_redeemable_positions(proxy_address: str):
                 cur_price = float(item.get("curPrice", 0) or 0)
             except Exception:
                 cur_price = 0.0
-            won = cur_price >= 0.999
-            if not won:
-                skipped_not_won += 1
-                continue
 
             try:
                 size = float(item.get("size", 0) or 0)
@@ -213,13 +213,12 @@ def get_redeemable_positions(proxy_address: str):
                     "outcomeIndex": outcome_index_int,
                     "indexSet": index_set,
                     "size": size,
+                    "curPrice": cur_price,
                     "title": item.get("title"),
                     "outcome": item.get("outcome"),
                 }
             )
 
-        if skipped_not_won:
-            log(f"🧹 已过滤未获胜/无价值仓位数量: {skipped_not_won}")
         if skipped_bad:
             log(f"🧹 已跳过缺少字段/无法解析的仓位数量: {skipped_bad}")
 
@@ -445,8 +444,42 @@ def run_cycle() -> None:
         log("未发现可领取仓位。")
         return
 
-    log(f"🔥 发现可领取 markets 数量: {len(redeemables)}")
-    for item in redeemables:
+    # 重新拉取一遍明细用于判断输赢（merged 结果缺少 curPrice）
+    raw = requests.get(
+        "https://data-api.polymarket.com/positions",
+        params={"user": PROXY_ADDRESS, "redeemable": "true", "limit": 50},
+        timeout=10,
+    ).json()
+    won_cids = set()
+    lost_cids = set()
+    for it in raw:
+        cid = it.get("conditionId")
+        if not cid:
+            continue
+        try:
+            cp = float(it.get("curPrice", 0) or 0)
+        except Exception:
+            cp = 0.0
+        if cp >= 0.999:
+            won_cids.add(cid)
+        elif cp <= 0.001:
+            lost_cids.add(cid)
+
+    won = [x for x in redeemables if x["conditionId"] in won_cids]
+    lost = [x for x in redeemables if x["conditionId"] in lost_cids and x["conditionId"] not in won_cids]
+    other = [x for x in redeemables if x["conditionId"] not in won_cids and x["conditionId"] not in lost_cids]
+
+    if lost and not REDEEM_LOSING_POSITIONS:
+        log(f"ℹ️ 发现可领取但为输仓（curPrice≈0）的 markets 数量: {len(lost)}，默认跳过以避免消耗 gas。")
+        log("   如需连输仓也一起 redeem，请在 .env 设置 REDEEM_LOSING_POSITIONS=true")
+
+    targets = won + (lost if REDEEM_LOSING_POSITIONS else []) + other
+    if not targets:
+        log("未发现可自动领取的仓位（赢仓=0 且已按配置跳过输仓）。")
+        return
+
+    log(f"🔥 将尝试领取 markets 数量: {len(targets)}（赢仓: {len(won)}，输仓: {len(lost)}，其他: {len(other)}）")
+    for item in targets:
         cond = item["conditionId"]
         idx_sets = item.get("indexSets") or [1, 2]
         redeem_via_proxy(w3, account, cond, idx_sets)
