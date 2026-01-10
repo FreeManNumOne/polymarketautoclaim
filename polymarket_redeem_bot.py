@@ -345,24 +345,31 @@ def run_cycle() -> None:
         return
 
     # 兼容 email/托管钱包：PM_ADDRESS 可能是合约钱包地址。
-    # 如果是合约钱包，我们需要确认“导出的私钥地址”是否就是该合约钱包的 owner，
-    # 否则无法在本地直接发起领取（需要 Polymarket/钱包提供方的 relayer/bundler 通道）。
+    # Polymarket email/Builder 钱包常见结构：
+    # - PM_ADDRESS 为合约钱包
+    # - 该钱包的 owner 是一个“owner 合约”（而不是你的 EOA）
+    # - 你的 EOA 可以调用 owner 合约的 proxy(...)，由 owner 合约再去调用钱包执行
     try:
         proxy_addr = Web3.to_checksum_address(PROXY_ADDRESS)
-        code = w3.eth.get_code(proxy_addr)
-        if code and len(code) > 0:
-            wallet = w3.eth.contract(address=proxy_addr, abi=WALLET_PROXY_ABI)
-            try:
-                wallet.functions.proxy([]).call({"from": account.address})
-                log("✅ 检测到合约钱包且当前私钥是 owner（可尝试链上自动领取）。")
-            except Exception as e:
-                if "must be called be owner" in str(e):
-                    log("❌ PM_ADDRESS 是合约钱包，但当前私钥地址不是该钱包的 owner。")
-                    log("   这类 email/托管钱包通常需要官方 relayer/bundler 才能出账执行领取。")
+        if _is_contract(w3, proxy_addr):
+            owner_contract_addr = _get_wallet_owner_contract(w3, proxy_addr)
+            if owner_contract_addr:
+                log(f"🔎 检测到合约钱包 owner 合约: {owner_contract_addr}")
+                owner_contract = w3.eth.contract(address=owner_contract_addr, abi=WALLET_PROXY_ABI)
+                try:
+                    # 验证：当前 EOA 是否被允许调用 owner 合约的 proxy(...)
+                    owner_contract.functions.proxy([]).call({"from": account.address})
+                    log("✅ 当前 EOA 可调用 owner 合约（可继续尝试自动领取）。")
+                except Exception as e:
+                    log("❌ 当前 EOA 无法调用 owner 合约的 proxy(...)。")
                     log(f"   你的 EOA(from private key): {account.address}")
                     log(f"   合约钱包(PM_ADDRESS): {proxy_addr}")
+                    log(f"   owner 合约: {owner_contract_addr}")
+                    log(f"   具体错误: {e}")
                     return
-                # 其他异常不直接退出，继续尝试原逻辑（避免误判）
+            else:
+                log("⚠️ PM_ADDRESS 是合约钱包，但无法识别 owner 合约地址（可能是钱包实现已升级）。")
+                log("   仍会继续尝试领取；若失败请提供最新报错。")
     except Exception:
         pass
 
