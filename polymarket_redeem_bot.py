@@ -112,6 +112,28 @@ SAFE_ABI = [
     },
 ]
 
+WALLET_PROXY_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "uint8", "name": "operation", "type": "uint8"},
+                    {"internalType": "address", "name": "to", "type": "address"},
+                    {"internalType": "uint256", "name": "value", "type": "uint256"},
+                    {"internalType": "bytes", "name": "data", "type": "bytes"},
+                ],
+                "internalType": "struct Call[]",
+                "name": "calls",
+                "type": "tuple[]",
+            }
+        ],
+        "name": "proxy",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+
 
 def log(message: str) -> None:
     """输出带时间戳的日志。"""
@@ -322,6 +344,28 @@ def run_cycle() -> None:
     except Exception:
         log("⚠️ 私钥无效或未配置（POLYMARKET_PRIVATE_KEY）。")
         return
+
+    # 兼容 email/托管钱包：PM_ADDRESS 可能是合约钱包地址。
+    # 如果是合约钱包，我们需要确认“导出的私钥地址”是否就是该合约钱包的 owner，
+    # 否则无法在本地直接发起领取（需要 Polymarket/钱包提供方的 relayer/bundler 通道）。
+    try:
+        proxy_addr = Web3.to_checksum_address(PROXY_ADDRESS)
+        code = w3.eth.get_code(proxy_addr)
+        if code and len(code) > 0:
+            wallet = w3.eth.contract(address=proxy_addr, abi=WALLET_PROXY_ABI)
+            try:
+                wallet.functions.proxy([]).call({"from": account.address})
+                log("✅ 检测到合约钱包且当前私钥是 owner（可尝试链上自动领取）。")
+            except Exception as e:
+                if "must be called be owner" in str(e):
+                    log("❌ PM_ADDRESS 是合约钱包，但当前私钥地址不是该钱包的 owner。")
+                    log("   这类 email/托管钱包通常需要官方 relayer/bundler 才能出账执行领取。")
+                    log(f"   你的 EOA(from private key): {account.address}")
+                    log(f"   合约钱包(PM_ADDRESS): {proxy_addr}")
+                    return
+                # 其他异常不直接退出，继续尝试原逻辑（避免误判）
+    except Exception:
+        pass
 
     conditions = get_redeemable_markets(PROXY_ADDRESS)
     if not conditions:
