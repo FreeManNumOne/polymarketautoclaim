@@ -28,6 +28,14 @@ RPC_URL = "https://polygon-rpc.com"
 # - 如果你希望把输仓也一并 redeem（有些情况下用于清理仓位/解锁状态），设为 true
 REDEEM_LOSING_POSITIONS = os.getenv("REDEEM_LOSING_POSITIONS", "false").strip().lower() in ("1", "true", "yes", "y")
 
+# 合约钱包路径下是否把多个 redeem 合并成一笔交易（强烈建议开启，省 gas）
+BATCH_REDEEMS = os.getenv("BATCH_REDEEMS", "true").strip().lower() in ("1", "true", "yes", "y")
+
+# gas 相关（用于“少付一点但更慢/避免高峰期溢价”）
+GAS_LIMIT_MULTIPLIER = float(os.getenv("GAS_LIMIT_MULTIPLIER", "1.15"))
+GAS_PRICE_MULTIPLIER = float(os.getenv("GAS_PRICE_MULTIPLIER", "1.0"))
+MAX_GAS_PRICE_GWEI = os.getenv("MAX_GAS_PRICE_GWEI", "").strip()  # 例如 60
+
 # 检查间隔（秒）(15 分钟 = 900 秒)
 CHECK_INTERVAL = 5 * 60
 
@@ -290,6 +298,86 @@ def _get_wallet_owner_contract(w3: Web3, wallet_addr: str) -> Optional[str]:
     return Web3.to_checksum_address("0x" + v.hex()[-40:])
 
 
+def _apply_gas_price_controls(w3: Web3, tx: dict) -> dict:
+    gp = int(w3.eth.gas_price)
+    if GAS_PRICE_MULTIPLIER != 1.0:
+        gp = max(1, int(gp * GAS_PRICE_MULTIPLIER))
+    if MAX_GAS_PRICE_GWEI:
+        try:
+            cap = int(float(MAX_GAS_PRICE_GWEI) * 1_000_000_000)
+            gp = min(gp, cap)
+        except Exception:
+            pass
+    tx["gasPrice"] = gp
+    return tx
+
+
+def _build_ctf_redeem_calldata(w3: Web3, condition_id: str, index_sets: list[int]) -> tuple[str, str, str]:
+    ctf_addr = Web3.to_checksum_address(CTF_ADDRESS)
+    usdc_addr = Web3.to_checksum_address(USDC_ADDRESS)
+    ctf = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
+    cond_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
+    data = ctf.functions.redeemPositions(
+        usdc_addr,
+        b"\x00" * 32,
+        cond_id_bytes,
+        index_sets,
+    )._encode_transaction_data()
+    return ctf_addr, usdc_addr, data
+
+
+def redeem_batch_via_contract_wallet(w3: Web3, account, items: list[dict]) -> None:
+    """
+    合约钱包路径：把多个 redeem 合并进一次交易：
+    EOA -> owner.proxy([ wallet.proxy([ CTF.redeemPositions, ... ]) ])
+    """
+    proxy_addr = Web3.to_checksum_address(PROXY_ADDRESS)
+    owner_contract_addr = _get_wallet_owner_contract(w3, proxy_addr)
+    if not owner_contract_addr:
+        raise RuntimeError("合约钱包无法识别 owner 合约地址，无法批量领取。")
+
+    owner_contract = w3.eth.contract(address=owner_contract_addr, abi=WALLET_PROXY_ABI)
+    wallet = w3.eth.contract(address=proxy_addr, abi=WALLET_PROXY_ABI)
+
+    calls = []
+    for it in items:
+        cid = it["conditionId"]
+        idx_sets = it.get("indexSets") or [1, 2]
+        ctf_addr, _, redeem_data = _build_ctf_redeem_calldata(w3, cid, idx_sets)
+        calls.append((1, ctf_addr, 0, bytes.fromhex(redeem_data[2:])))  # wallet.proxy: op=1 表示 CALL
+
+    wallet_proxy_data = wallet.functions.proxy(calls)._encode_transaction_data()
+
+    log(f"⚙️ 批量领取 markets 数量: {len(items)}（单笔交易）")
+    tx_call = owner_contract.functions.proxy([(2, proxy_addr, 0, bytes.fromhex(wallet_proxy_data[2:]))])  # owner.proxy: op=2 表示 CALL
+
+    tx = tx_call.build_transaction(
+        {
+            "from": account.address,
+            "chainId": 137,
+            "nonce": w3.eth.get_transaction_count(account.address),
+        }
+    )
+    tx = _apply_gas_price_controls(w3, tx)
+
+    try:
+        est_gas = w3.eth.estimate_gas(tx)
+        tx["gas"] = max(21000, int(est_gas * GAS_LIMIT_MULTIPLIER))
+    except Exception:
+        tx["gas"] = 800000
+
+    signed_tx = w3.eth.account.sign_transaction(tx, PRIVATE_KEY)
+    raw_tx = get_raw_tx_bytes(signed_tx)
+    tx_hash = w3.eth.send_raw_transaction(raw_tx)
+    log(f"🚀 已发送批量交易: https://polygonscan.com/tx/{w3.to_hex(tx_hash)}")
+
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    if receipt.status == 1:
+        log("✅ 批量领取成功！")
+    else:
+        log("❌ 批量交易执行失败（revert）。")
+
+
 def redeem_via_proxy(w3: Web3, account, condition_id: str, index_sets: list[int]) -> None:
     # web3.py v7 默认只接受 checksum address；为了兼容你在 .env 里配置小写地址，这里统一转换
     try:
@@ -303,34 +391,18 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str, index_sets: list[int]
     except Exception as e:
         raise ValueError("脚本内置合约地址无法转换为 checksum（异常情况）") from e
 
-    ctf = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
-
     log(f"⚙️ 准备领取 conditionId: {condition_id} indexSets={index_sets}")
 
     try:
-        cond_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
-
-        # 1) 生成对 CTF.redeemPositions 的 calldata
-        ctf_tx_dummy = ctf.functions.redeemPositions(
-            usdc_addr,
-            b"\x00" * 32,
-            cond_id_bytes,
-            index_sets,
-        ).build_transaction(
-            {
-                "chainId": 137,
-                "gas": 0,
-                "gasPrice": 0,
-                "from": "0x0000000000000000000000000000000000000000",
-            }
-        )
-        ctf_data = ctf_tx_dummy["data"]
+        ctf_addr, usdc_addr, ctf_data = _build_ctf_redeem_calldata(w3, condition_id, index_sets)
 
         # 2) 根据 PM_ADDRESS 类型选择执行路径：
         # - EOA：直接从 EOA 调用 CTF.redeemPositions
         # - 合约钱包（email/builder）：EOA -> ownerContract.proxy([ wallet.proxy([ CTF.call ]) ])
         if not _is_contract(w3, proxy_addr):
             log("🧾 PM_ADDRESS 为 EOA，直接发起 redeemPositions。")
+            ctf = w3.eth.contract(address=ctf_addr, abi=CTF_ABI)
+            cond_id_bytes = bytes.fromhex(condition_id.replace("0x", ""))
             tx_call = ctf.functions.redeemPositions(
                 usdc_addr,
                 b"\x00" * 32,
@@ -364,13 +436,13 @@ def redeem_via_proxy(w3: Web3, account, condition_id: str, index_sets: list[int]
                 "from": account.address,
                 "chainId": 137,
                 "nonce": w3.eth.get_transaction_count(account.address),
-                "gasPrice": w3.eth.gas_price,
             }
         )
+        tx = _apply_gas_price_controls(w3, tx)
 
         try:
             est_gas = w3.eth.estimate_gas(tx)
-            tx["gas"] = int(est_gas * 1.3)
+            tx["gas"] = max(21000, int(est_gas * GAS_LIMIT_MULTIPLIER))
         except Exception:
             tx["gas"] = 500000
 
@@ -481,6 +553,16 @@ def run_cycle() -> None:
         return
 
     log(f"🔥 将尝试领取 markets 数量: {len(targets)}（赢仓: {len(won)}，输仓: {len(lost)}，其他: {len(other)}）")
+
+    # 合约钱包：优先批量合并成一笔交易省 gas
+    try:
+        proxy_addr = Web3.to_checksum_address(PROXY_ADDRESS)
+        if BATCH_REDEEMS and _is_contract(w3, proxy_addr) and len(targets) > 1:
+            redeem_batch_via_contract_wallet(w3, account, targets)
+            return
+    except Exception:
+        pass
+
     for item in targets:
         cond = item["conditionId"]
         idx_sets = item.get("indexSets") or [1, 2]
